@@ -22,7 +22,7 @@ def test():
     b = torch.randn(vector_size, device="cuda", dtype=torch.float32)
     c = torch.empty_like(a)
 
-    grid = (triton.cdiv(vector_size, block_size),)
+    grid = (triton.cdiv(vector_size, block_size),2) # = (16,)
 
     # Launch kernel
     vector_add_kernel[grid](a, b, c, vector_size, BLOCK=block_size)
@@ -34,3 +34,8 @@ def test():
 
 if __name__ == "__main__":
     test()
+
+ 
+# SO we will have 2D grid with 32 program 16 row 2 column ,right
+1.# return first block in the grtid and for program_id(1) return  second column i thnk it should be program 16
+2. # work normally eventhough we add new dimension to the tensor it won't broke the program because the program slot in grid that didin't use wil be left like that ตราบใดที่  the number value store when write memory is not exceed, right
