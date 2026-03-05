@@ -1,21 +1,12 @@
 """
 Pure CuTile Multi-Head Attention Implementation
 End-to-end implementation using only NVIDIA CuTile kernels
-
-Includes FlashAttention optimization for better performance.
 """
 
 import cuda.tile as ct
 import cupy as cp
 import numpy as np
 from typing import Optional, Tuple
-
-# Import FlashAttention
-from flash_attention import flash_attention
-
-# Global flag to enable/disable FlashAttention
-# V1: FlashAttention disabled - uses CuPy fallback (einsum-based attention)
-USE_FLASH_ATTENTION = False
 
 
 def get_stream():
@@ -26,41 +17,6 @@ def get_stream():
 # ============================================================================
 # CuTile Kernels for Attention
 # ============================================================================
-
-@ct.kernel
-def qk_scores_kernel(
-    q,              # Query: (batch_heads, seq_q, head_dim)
-    k,              # Key: (batch_heads, seq_k, head_dim)
-    scores,         # Output: (batch_heads, seq_q, seq_k)
-    scale: ct.Constant[float],
-    head_dim: ct.Constant[int]
-):
-    """
-    Compute Q @ K^T scaled attention scores.
-    Each block handles one (batch_head, query_pos) pair.
-    """
-    pid_bh = ct.bid(0)  # batch * heads
-    pid_q = ct.bid(1)   # query position
-
-    # Load query vector for this position
-    q_tile = ct.load(q, index=(pid_bh, pid_q, 0), shape=(1, 1, head_dim))
-    q_tile = ct.reshape(q_tile, (head_dim, 1))  # (head_dim, 1) for matmul
-
-    # Load all K vectors (transposed view needed for K^T)
-    # K is (batch_heads, seq_k, head_dim), we need K^T = (head_dim, seq_k)
-    # Load K for this batch_head: shape (seq_k, head_dim)
-    # We'll compute dot products one at a time since we can't load arbitrary seq_k
-
-    # For now, compute Q[i] @ K^T as a reduction over head_dim
-    # This requires loading K row by row
-
-    # Alternative: Use tiled approach with fixed block sizes
-    # For simplicity, load Q vector and iterate over K positions
-    q_vec = ct.reshape(q_tile, (head_dim,))
-
-    # Store scaled dot products
-    # Note: This is a simplified version - in practice we'd tile this better
-
 
 @ct.kernel
 def attention_scores_kernel(
@@ -236,15 +192,7 @@ class MultiHeadAttention:
         batch, num_heads, seq_q, head_dim = q.shape
         _, num_kv_heads, seq_k, _ = k.shape
 
-        # V8.2: FlashAttention handles GQA natively - skip expansion to avoid copies
-        # Only expand for non-FlashAttention paths (fallback)
-        if USE_FLASH_ATTENTION and attention_mask is None:
-            # Pass directly to flash_attention which handles GQA via QUERY_GROUP_SIZE
-            return scaled_dot_product_attention(
-                q, k, v, attention_mask, is_causal, self.scale
-            )
-
-        # Fallback path: expand KV for GQA
+        # Expand KV for GQA
         if num_kv_heads != num_heads:
             k = self._expand_kv(k, self.num_queries_per_kv)
             v = self._expand_kv(v, self.num_queries_per_kv)
@@ -254,11 +202,7 @@ class MultiHeadAttention:
         )
 
     def _expand_kv(self, x: cp.ndarray, num_repeats: int) -> cp.ndarray:
-        """Expand KV heads for GQA using broadcast (V6: zero-copy).
-
-        Instead of repeat() which creates a copy, we use reshape + broadcast_to
-        to create a view that can be used directly in FlashAttention.
-        """
+        """Expand KV heads for GQA using broadcast (V6: zero-copy)."""
         batch, num_kv_heads, seq_len, head_dim = x.shape
 
         # V6: Use expand + reshape for zero-copy expansion
@@ -267,8 +211,6 @@ class MultiHeadAttention:
         # -> broadcast to (batch, num_kv_heads, num_repeats, seq_len, head_dim)
         # -> reshape to (batch, num_kv_heads * num_repeats, seq_len, head_dim)
 
-        # Note: broadcast_to creates a view, but FlashAttention needs contiguous
-        # For now, use ascontiguousarray only when needed
         x_expanded = cp.broadcast_to(
             x[:, :, None, :, :],
             (batch, num_kv_heads, num_repeats, seq_len, head_dim)
@@ -313,13 +255,6 @@ def scaled_dot_product_attention(
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
-
-    # Try FlashAttention first (fastest)
-    if USE_FLASH_ATTENTION and attention_mask is None:
-        try:
-            return flash_attention(q, k, v, scale, causal=is_causal)
-        except Exception as e:
-            pass  # Fall through to other implementations
 
     # Check if dimensions fit CuTile requirements
     seq_k_padded = next_power_of_two(seq_k)

@@ -54,44 +54,14 @@ ask_continue() {
 }
 
 # =========================
-# Detect GPU Architecture
-# =========================
-detect_gpu_arch() {
-	echo ">>> Detecting GPU architecture..."
-
-	if ! command -v nvidia-smi >/dev/null 2>&1; then
-		echo "    WARNING: nvidia-smi not found, cannot detect GPU"
-		IS_BLACKWELL=false
-		return
-	fi
-
-	# Get GPU name
-	GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)
-	echo "    GPU detected: ${GPU_NAME}"
-
-	# Blackwell GPUs: B100, B200, GB200, RTX 50xx series
-	# Compute Capability 10.0+ (sm_100+)
-	if echo "${GPU_NAME}" | grep -qiE "(B100|B200|GB200|RTX 50|Blackwell)"; then
-		IS_BLACKWELL=true
-		echo "    Architecture: Blackwell (CC 10.x)"
-	else
-		IS_BLACKWELL=false
-		# Try to get compute capability via deviceQuery or python
-		echo "    Architecture: Non-Blackwell (will use Hopper hack)"
-	fi
-}
-
-# =========================
 # Sanity hints (non-fatal)
 # =========================
 echo ">>> Assumptions:"
-echo "    - NVIDIA driver >= r580 (Blackwell) or >= r550 (Hopper)"
+echo "    - NVIDIA driver >= r580 (Blackwell)"
 echo "    - CUDA Toolkit >= 13.1"
-echo "    - Blackwell GPU (CC 10.x) or Hopper GPU (CC 9.x with hack)"
+echo "    - Blackwell GPU (CC 10.x)"
 echo
 
-detect_gpu_arch
-echo
 ask_continue "Proceed with environment setup?"
 
 # =========================
@@ -183,99 +153,48 @@ ask_continue "Install CUDA Toolkit via conda?"
 conda install -y nvidia::cuda
 
 # =========================
+# Core CUDA Python stack
+# =========================
+echo ">>> Installing CUDA Python stack (CUDA 13)"
+
+python -m pip install "cupy-${CUDA_TAG}" cuda-tile numpy
+
+# =========================
 # PyTorch (architecture-specific)
 # =========================
 # Install PyTorch BEFORE other CUDA Python packages to prevent
 # accelerate from pulling the wrong torch build from default PyPI.
-echo ">>> Installing PyTorch (architecture-specific)"
-ask_continue "Install PyTorch?"
-
-if [ "${IS_BLACKWELL}" = true ]; then
-	echo "    Installing for Blackwell (sm_120 support)..."
-	pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
-else
-	# Non-Blackwell: use stable PyTorch with CUDA 12.4
-	pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
-fi
-
-# =========================
-# Core CUDA Python stack
-# =========================
-echo ">>> Installing CUDA Python stack (CUDA 13)"
-ask_continue "Install Python packages (cupy, cuda-python, cuda-tile)?"
-
-# CuPy for CUDA 13
-pip install "cupy-${CUDA_TAG}"
-
-# NVIDIA CUDA Python bindings (driver/runtime API)
-pip install cuda-python
-
-# cuTile Python
-pip install cuda-tile
+echo ">>> Installing PyTorch (Blackwell, CUDA 13.x)"
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
 # =========================
 # CUDA Environment Variables
 # =========================
-echo ">>> Configuring CUDA environment variables..."
+# echo ">>> Configuring CUDA environment variables..."
 
-CONDA_ENV_PATH=$(conda info --envs | grep "^${ENV_NAME} " | awk '{print $NF}')
-if [ -n "${CONDA_ENV_PATH}" ]; then
-	mkdir -p "${CONDA_ENV_PATH}/etc/conda/activate.d"
-	mkdir -p "${CONDA_ENV_PATH}/etc/conda/deactivate.d"
+# CONDA_ENV_PATH=$(conda info --envs | grep "^${ENV_NAME} " | awk '{print $NF}')
+# if [ -n "${CONDA_ENV_PATH}" ]; then
+# 	mkdir -p "${CONDA_ENV_PATH}/etc/conda/activate.d"
+# 	mkdir -p "${CONDA_ENV_PATH}/etc/conda/deactivate.d"
 
-	# Get the project root directory (parent of utils/)
-	SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-	PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# 	# Get the project root directory (parent of utils/)
+# 	SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 	PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-	# Create activation script
-	cat >"${CONDA_ENV_PATH}/etc/conda/activate.d/cutile_env.sh" <<EOF
-#!/bin/bash
-# CUDA_PATH for CuPy to find CUDA headers
-export CUDA_PATH=\${CONDA_PREFIX}/targets/x86_64-linux
-EOF
+# 	# Create activation script
+# 	cat >"${CONDA_ENV_PATH}/etc/conda/activate.d/cutile_env.sh" <<EOF
+# #!/bin/bash
+# # CUDA_PATH for CuPy to find CUDA headers
+# export CUDA_PATH=\${CONDA_PREFIX}/targets/x86_64-linux
+# EOF
 
-	# Create deactivation script
-	cat >"${CONDA_ENV_PATH}/etc/conda/deactivate.d/cutile_env.sh" <<'EOF'
-#!/bin/bash
-unset CUDA_PATH
-EOF
-	echo "    CUDA_PATH configured for CuPy."
-fi
-
-# =========================
-# Hopper Hack (non-Blackwell only)
-# =========================
-if [ "${IS_BLACKWELL}" = false ]; then
-	echo
-	echo ">>> Non-Blackwell GPU detected. Applying Hopper compatibility hack..."
-	echo "    This uses a CuPy-based compatibility layer instead of tileiras compiler."
-	ask_continue "Apply Hopper hack?"
-
-	# Add hack-hopper to PYTHONPATH in activation script
-	if [ -n "${CONDA_ENV_PATH}" ] && [ -n "${PROJECT_ROOT}" ]; then
-		# Append to existing activation script
-		cat >>"${CONDA_ENV_PATH}/etc/conda/activate.d/cutile_env.sh" <<EOF
-
-# Hopper hack: use CuPy-based compatibility layer for non-Blackwell GPUs
-export CUTILE_HACK_HOPPER_DIR="${PROJECT_ROOT}/utils/hack-hopper"
-export PYTHONPATH="\${CUTILE_HACK_HOPPER_DIR}:\${PYTHONPATH}"
-EOF
-
-		# Append to existing deactivation script
-		cat >>"${CONDA_ENV_PATH}/etc/conda/deactivate.d/cutile_env.sh" <<'EOF'
-
-# Remove hack-hopper from PYTHONPATH
-if [ -n "${CUTILE_HACK_HOPPER_DIR}" ]; then
-    PYTHONPATH="${PYTHONPATH//${CUTILE_HACK_HOPPER_DIR}:/}"
-    PYTHONPATH="${PYTHONPATH//:${CUTILE_HACK_HOPPER_DIR}/}"
-    PYTHONPATH="${PYTHONPATH//${CUTILE_HACK_HOPPER_DIR}/}"
-fi
-unset CUTILE_HACK_HOPPER_DIR
-EOF
-		echo "    Hopper hack installed to conda environment activation scripts."
-		echo "    hack-hopper path: ${PROJECT_ROOT}/utils/hack-hopper"
-	fi
-fi
+# 	# Create deactivation script
+# 	cat >"${CONDA_ENV_PATH}/etc/conda/deactivate.d/cutile_env.sh" <<'EOF'
+# #!/bin/bash
+# unset CUDA_PATH
+# EOF
+# 	echo "    CUDA_PATH configured for CuPy."
+# fi
 
 # =========================
 # Optional but recommended
@@ -283,33 +202,32 @@ fi
 echo ">>> Installing optional tooling"
 
 # NVML access (driver introspection, useful for debugging)
-pip install pynvml
+python -m pip install pynvml
 
 # NumPy (used by almost all examples)
-pip install numpy
+python -m pip install numpy
 
 # =========================
 # HuggingFace & ML Tools (for hw1-asr and beyond)
 # =========================
 echo ">>> Installing HuggingFace ecosystem and ML tools"
-ask_continue "Install HuggingFace (transformers, datasets, etc.) and Streamlit?"
 
 # HuggingFace ecosystem
-pip install transformers datasets huggingface_hub accelerate safetensors
+python -m pip install transformers datasets huggingface_hub accelerate safetensors
 
 # Streamlit for web apps
-pip install streamlit
+python -m pip install streamlit
 
 # Audio processing (for ASR tasks)
-pip install soundfile librosa
+python -m pip install soundfile librosa
 
 # =========================
 # Fix cuda-bindings version conflict
 # =========================
 # PyTorch pins cuda-bindings to its bundled version, but cuda-python/cuda-tile
 # need ~=13.1.1. Force 13.1.x last so it isn't overwritten by transitive deps.
-echo ">>> Fixing cuda-bindings version for cuTile compatibility..."
-pip install "cuda-bindings~=13.1.1" "cuda-python~=13.1.1" --force-reinstall --quiet
+# echo ">>> Fixing cuda-bindings version for cuTile compatibility..."
+# python -m pip install "cuda-bindings~=13.1.1" "cuda-python~=13.1.1" --force-reinstall --quiet
 
 # =========================
 # Freeze snapshot
@@ -339,21 +257,11 @@ echo "    - cuda-tile"
 echo
 echo "  HuggingFace & ML:"
 echo "    - transformers, datasets, huggingface_hub, safetensors"
-if [ "${IS_BLACKWELL}" = true ]; then
-	echo "    - torch, torchvision (cu130 for Blackwell)"
-else
-	echo "    - torch, torchaudio (stable, cu124)"
-fi
+echo "    - torch, torchvision (cu130 for Blackwell)"
 echo "    - streamlit"
 echo "    - soundfile, librosa"
 echo
-echo "GPU: ${GPU_NAME:-unknown}"
-if [ "${IS_BLACKWELL}" = true ]; then
-	echo "Architecture: Blackwell (native support)"
-else
-	echo "Architecture: Non-Blackwell (CuPy-based compatibility layer)"
-	echo "  PYTHONPATH includes hack-hopper on activation"
-fi
+echo "Architecture: Blackwell (native support)"
 echo
 echo "NOTE: If you installed Miniconda now, restart your shell if needed."
 echo

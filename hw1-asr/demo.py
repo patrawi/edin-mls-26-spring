@@ -7,6 +7,7 @@ import streamlit as st
 import numpy as np
 import time
 import sys
+import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
@@ -17,6 +18,106 @@ st.set_page_config(
     layout="centered"
 )
 
+def get_cached_model(model_key, loader_fn):
+    """Cache a single model bundle per session to avoid repeated loads."""
+    current_key = st.session_state.get("current_model_key")
+    current_bundle = st.session_state.get("current_model_bundle")
+
+    if current_key == model_key and current_bundle is not None:
+        return current_bundle, True
+
+    if current_bundle is not None and current_key != model_key:
+        st.session_state.current_model_bundle = None
+        st.session_state.current_model_key = None
+        release_model_bundle(current_bundle)
+        clear_other_model_caches(except_key=model_key)
+
+    bundle = loader_fn()
+    st.session_state.current_model_key = model_key
+    st.session_state.current_model_bundle = bundle
+    return bundle, False
+
+
+def release_model_bundle(bundle):
+    """Best-effort release of GPU/CPU memory for a model bundle."""
+    try:
+        del bundle
+    except Exception:
+        pass
+
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+    try:
+        import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+
+def clear_other_model_caches(except_key=None):
+    """Clear Streamlit cached resources for other models."""
+    for key, (_, loader_fn) in MODEL_LOADERS.items():
+        if key == except_key:
+            continue
+        clear_fn = getattr(loader_fn, "clear", None)
+        if callable(clear_fn):
+            clear_fn()
+
+
+def force_reload_models():
+    """Force clear Streamlit cache and module cache for model reload."""
+    current_key = st.session_state.get("current_model_key")
+    current_bundle = st.session_state.get("current_model_bundle")
+
+    if current_bundle is not None:
+        release_model_bundle(current_bundle)
+
+    if current_key in MODEL_LOADERS:
+        _, loader_fn = MODEL_LOADERS[current_key]
+        clear_fn = getattr(loader_fn, "clear", None)
+        if callable(clear_fn):
+            clear_fn()
+
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+    for mod_name in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'decode_attention']:
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+
+    st.session_state.current_model_bundle = None
+    st.session_state.current_model_key = None
+
+
+def _prepare_model_path(folder_path):
+    """Ensure target folder is first in sys.path and remove other model paths."""
+    for p in list(sys.path):
+        if os.path.isdir(p) and os.path.basename(p).startswith("glm_asr_"):
+            try:
+                sys.path.remove(p)
+            except ValueError:
+                pass
+    if folder_path not in sys.path:
+        sys.path.insert(0, folder_path)
+    else:
+        sys.path.remove(folder_path)
+        sys.path.insert(0, folder_path)
+
 
 def load_cutile_model_generic(folder_name, backend_config=None):
     """Load CuTile model from specified folder."""
@@ -25,12 +126,11 @@ def load_cutile_model_generic(folder_name, backend_config=None):
     start = time.perf_counter()
 
     cutile_path = str(BASE_DIR / folder_name)
-    if cutile_path not in sys.path:
-        sys.path.insert(0, cutile_path)
+    _prepare_model_path(cutile_path)
 
     # Clear cached modules
     mods_to_clear = [m for m in sys.modules.keys()
-                     if m in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'flash_attention', 'decode_attention']]
+                     if m in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'decode_attention']]
     for m in mods_to_clear:
         del sys.modules[m]
 
@@ -43,10 +143,6 @@ def load_cutile_model_generic(folder_name, backend_config=None):
             layers.MLP.USE_CUBLAS_FP16 = backend_config['USE_CUBLAS_FP16']
         if 'FUSED' in backend_config:
             layers.MLP.FUSED = backend_config['FUSED']
-
-        if 'USE_FLASH_ATTENTION' in backend_config:
-            attention = importlib.import_module("attention")
-            attention.USE_FLASH_ATTENTION = backend_config['USE_FLASH_ATTENTION']
 
     weight_loader = importlib.import_module("weight_loader")
     model, processor = weight_loader.load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
@@ -69,37 +165,78 @@ def load_cutile_model():
 
 
 @st.cache_resource
-def load_cutile_v1_model():
-    """Load CuTile V1 (Initial CuPy) model."""
+def load_cutile_example_model():
+    """Load CuTile Example (Initial CuPy) model."""
     config = {
         'BACKEND': 'cublas',
-        'FUSED': False,
-        'USE_FLASH_ATTENTION': False
+        'FUSED': False
     }
-    return load_cutile_model_generic("glm_asr_cutile_v1", config)
+    return load_cutile_model_generic("glm_asr_cutile_example", config)
 
 
-@st.cache_resource
-def load_cutile_v10_model():
-    """Load CuTile V10 (FP16 Optimized) model."""
-    config = {
-        'BACKEND': 'cublas_fp16',
-        'USE_CUBLAS_FP16': True,
-        'FUSED': True
-    }
-    return load_cutile_model_generic("glm_asr_cutile_v10", config)
-
-
-@st.cache_resource
-def load_scratch_model():
-    """Load PyTorch scratch model."""
+def load_triton_model_generic(folder_name, backend_config=None):
+    """Load Triton model from specified folder."""
     import importlib
 
     start = time.perf_counter()
 
-    scratch_path = str(BASE_DIR / "glm_asr_scratch")
-    if scratch_path not in sys.path:
-        sys.path.insert(0, scratch_path)
+    triton_path = str(BASE_DIR / folder_name)
+    _prepare_model_path(triton_path)
+
+    mods_to_clear = [m for m in sys.modules.keys()
+                     if m in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'decode_attention']]
+    for m in mods_to_clear:
+        del sys.modules[m]
+
+    if backend_config:
+        layers = importlib.import_module("layers")
+        if 'BACKEND' in backend_config:
+            layers.Linear.BACKEND = backend_config['BACKEND']
+        if 'FUSED' in backend_config:
+            layers.MLP.FUSED = backend_config['FUSED']
+
+    weight_loader = importlib.import_module("weight_loader")
+    model, processor = weight_loader.load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
+
+    from tokenizers import Tokenizer
+    from huggingface_hub import snapshot_download
+    model_dir = snapshot_download("zai-org/GLM-ASR-Nano-2512")
+    tokenizer = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+
+    load_time_ms = (time.perf_counter() - start) * 1000
+
+    return model, processor, tokenizer, load_time_ms
+
+
+@st.cache_resource
+def load_triton_example_model():
+    """Load Triton Example (Baseline) model."""
+    config = {
+        'BACKEND': 'cublas',
+        'FUSED': False
+    }
+    return load_triton_model_generic("glm_asr_triton_example", config)
+
+
+@st.cache_resource
+def load_triton_template_model():
+    """Load Triton Template model."""
+    config = {
+        'BACKEND': 'cublas',
+        'FUSED': False
+    }
+    return load_triton_model_generic("glm_asr_triton_template", config)
+
+
+def load_torch_model(folder_name, dtype="auto"):
+    """Load a Torch-based model from the specified folder."""
+    import importlib
+
+    start = time.perf_counter()
+
+    folder_path = str(BASE_DIR / folder_name)
+    if folder_path not in sys.path:
+        sys.path.insert(0, folder_path)
 
     # Clear cached modules
     mods_to_clear = [m for m in sys.modules.keys()
@@ -112,12 +249,30 @@ def load_scratch_model():
     model_dir = snapshot_download("zai-org/GLM-ASR-Nano-2512")
 
     torch_glm = importlib.import_module("torch_glm")
-    model, processor = torch_glm.load_model_and_processor(model_path=model_dir, dtype="auto")
+    model, processor = torch_glm.load_model_and_processor(model_path=model_dir, dtype=dtype)
     tokenizer = None
 
     load_time_ms = (time.perf_counter() - start) * 1000
 
     return model, processor, tokenizer, load_time_ms
+
+
+@st.cache_resource
+def load_scratch_model():
+    """Load PyTorch scratch model."""
+    return load_torch_model("glm_asr_scratch")
+
+
+MODEL_CHOICES = [
+    ("Triton Example (Baseline)", "triton_example", load_triton_example_model),
+    ("Triton Template", "triton_template", load_triton_template_model),
+    ("CuTile Example (Baseline)", "cutile_example", load_cutile_example_model),
+    ("CuTile Template", "cutile_template", load_cutile_model),
+    ("Scratch (PyTorch)", "scratch", load_scratch_model),
+]
+MODEL_LABELS = [label for label, _, _ in MODEL_CHOICES]
+MODEL_BY_LABEL = {label: (key, loader) for label, key, loader in MODEL_CHOICES}
+MODEL_LOADERS = {key: (label, loader) for label, key, loader in MODEL_CHOICES}
 
 
 def transcribe_cutile(audio_array, model, processor, tokenizer):
@@ -171,14 +326,66 @@ def transcribe_cutile(audio_array, model, processor, tokenizer):
     return transcription, elapsed_ms
 
 
-def transcribe_scratch(audio_array, model, processor, tokenizer):
-    """Run PyTorch scratch inference."""
+def transcribe_triton(audio_array, model, processor, tokenizer):
+    """Run Triton inference."""
+    import torch
+
+    TOKEN_IDS = {
+        "begin_of_audio": 59261, "end_of_audio": 59262,
+        "user": 59253, "assistant": 59254, "audio": 59260,
+    }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    features = processor.feature_extractor(audio_array, sampling_rate=16000, return_tensors="pt")
+    input_features = features.input_features.to(device=device, dtype=torch.float32)
+    mel_time = input_features.shape[2]
+    num_audio_tokens = mel_time // 4
+
+    prompt_tokens = [TOKEN_IDS["begin_of_audio"]] + [TOKEN_IDS["audio"]] * num_audio_tokens + [
+        TOKEN_IDS["end_of_audio"], TOKEN_IDS["user"]]
+    instruction_tokens = tokenizer.encode("Please transcribe this audio into text").ids
+    prompt_tokens.extend(instruction_tokens)
+    prompt_tokens.append(TOKEN_IDS["assistant"])
+
+    input_ids = torch.tensor([prompt_tokens], dtype=torch.int64, device=device)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    generated_ids = model.generate(
+        input_features,
+        input_ids=input_ids,
+        input_features_mask=None,
+        max_new_tokens=200,
+        temperature=1.0,
+        top_k=1
+    )
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed_ms = (time.perf_counter() - start) * 1000
+
+    generated_np = generated_ids.detach().cpu().numpy()
+    raw_transcription = tokenizer.decode(generated_np[0].tolist(), skip_special_tokens=False)
+
+    transcription = raw_transcription
+    if "<|assistant|>" in transcription:
+        transcription = transcription.split("<|assistant|>")[-1]
+    for token in ["<|endoftext|>", "<|user|>", "<|begin_of_audio|>", "<|end_of_audio|>", "<|pad|>"]:
+        transcription = transcription.replace(token, "")
+    transcription = transcription.strip()
+
+    return transcription, elapsed_ms
+
+
+def transcribe_scratch(audio_array, model, processor, tokenizer, folder_name="glm_asr_scratch"):
+    """Run Torch-based inference (scratch)."""
     import torch
     import importlib
 
-    scratch_path = str(BASE_DIR / "glm_asr_scratch")
-    if scratch_path not in sys.path:
-        sys.path.insert(0, scratch_path)
+    folder_path = str(BASE_DIR / folder_name)
+    if folder_path not in sys.path:
+        sys.path.insert(0, folder_path)
 
     torch_glm = importlib.import_module("torch_glm")
 
@@ -282,24 +489,25 @@ st.title("🎤 GLM-ASR Student Demo")
 st.caption("Test your implementation")
 
 # Version selection
-version = st.radio("Select version:", ["CuTile V1 (Baseline)", "CuTile V10 (Optimized)", "CuTile Template", "Scratch (PyTorch)"], horizontal=True)
+version = st.radio("Select version:", MODEL_LABELS, horizontal=True)
+if st.button("🔄 Force reload model", use_container_width=True):
+    force_reload_models()
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
 # Load model
 with st.spinner(f"Loading {version} model..."):
     try:
-        if version == "CuTile V1 (Baseline)":
-            model, processor, tokenizer, load_time_ms = load_cutile_v1_model()
-        elif version == "CuTile V10 (Optimized)":
-            model, processor, tokenizer, load_time_ms = load_cutile_v10_model()
-        elif version == "CuTile Template":
-            model, processor, tokenizer, load_time_ms = load_cutile_model()
+        model_key, loader_fn = MODEL_BY_LABEL[version]
+        (model, processor, tokenizer, load_time_ms), reused = get_cached_model(model_key, loader_fn)
+
+        st.session_state.model_load_time_ms = load_time_ms
+        if reused:
+            st.success("Model loaded | Reusing cached instance")
         else:
-            model, processor, tokenizer, load_time_ms = load_scratch_model()
-
-        if 'model_load_time_ms' not in st.session_state:
-            st.session_state.model_load_time_ms = load_time_ms
-
-        st.success(f"Model loaded | Initial load: {st.session_state.model_load_time_ms:.0f} ms")
+            st.success(f"Model loaded | Initial load: {load_time_ms:.0f} ms")
     except Exception as e:
         st.error(f"Failed to load model: {e}")
         import traceback
@@ -367,8 +575,10 @@ if audio_array is not None:
     if st.button("▶️ Transcribe", type="primary", use_container_width=True):
         with st.spinner("Transcribing..."):
             try:
-                if version in ["CuTile Template", "CuTile V1 (Baseline)", "CuTile V10 (Optimized)"]:
+                if version in ["CuTile Template", "CuTile Example (Baseline)"]:
                     result, elapsed_ms = transcribe_cutile(audio_array, model, processor, tokenizer)
+                elif version == "Triton Example (Baseline)":
+                    result, elapsed_ms = transcribe_triton(audio_array, model, processor, tokenizer)
                 else:
                     result, elapsed_ms = transcribe_scratch(audio_array, model, processor, tokenizer)
 
